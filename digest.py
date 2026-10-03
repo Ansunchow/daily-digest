@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 云端「每日要闻速报」生成器（AI + 智能网络物流 + 每日饮食）。
-- 新闻：RSS 聚合（免费、无需密钥），单源挂掉自动跳过；若设置 NEWS_API_KEY 则额外用 LLM 把标题精编成 ≤40 字摘要。
+- 新闻：RSS 聚合（免费、无需密钥），单源挂掉自动跳过；纯英文标题自动经 MyMemory 免费接口翻成中文（无需密钥）；若另设 NEWS_API_KEY 则改用 LLM 精编成 ≤40 字摘要。
 - 饮食：按星期几取固定周菜单（确定性，无需联网）。
 - 推送：PushPlus（token 取环境变量 PUSHPLUS_TOKEN，否则取本地 token 文件）。
 设计为可在 GitHub Actions 中运行（cron 触发），与本机 WorkBuddy 无关。
@@ -10,8 +10,10 @@ import os
 import io
 import gzip
 import json
+import time
 import urllib.request
 import urllib.error
+import urllib.parse
 import datetime
 import html as _html
 from email.utils import parsedate_to_datetime
@@ -24,6 +26,8 @@ AI_FEEDS = [
     ("QbitAI 量子位", "https://www.qbitai.com/feed"),
     ("机器之心", "https://www.jiqizhixin.com/rss"),
     ("36氪", "https://36kr.com/feed"),
+    ("TechCrunch AI", "https://techcrunch.com/category/artificial-intelligence/feed/"),
+    ("ZDNet AI", "https://www.zdnet.com/topic/artificial-intelligence/rss.xml"),
 ]
 LOGI_FEEDS = [
     ("Google News", "https://news.google.com/rss/search?q=%E6%99%BA%E8%83%BD%E7%89%A9%E6%B5%81%20OR%20%E6%99%BA%E6%85%A7%E7%89%A9%E6%B5%81%20OR%20%E7%BD%91%E7%BB%9C%E8%B4%A7%E8%BF%90%20OR%20%E8%87%AA%E5%8A%A8%E9%A9%BE%E9%A9%B6%E5%8D%A1%E8%BD%A6%20OR%20%E6%97%A0%E4%BA%BA%E9%85%8D%E9%80%81%20OR%20%E4%BE%9B%E5%BA%94%E9%93%BE&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"),
@@ -86,6 +90,24 @@ def is_english_title(s):
     return has_letter and not has_cjk
 
 
+def translate_to_zh(text):
+    """免费翻译兜底（MyMemory，无需密钥）：把英文标题翻成中文。失败返回 None。"""
+    q = text.strip()
+    if not q:
+        return None
+    url = "https://api.mymemory.translated.net/get?q=" + urllib.parse.quote(q) + "&langpair=en|zh-CN"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            j = json.load(r)
+        tr = (j.get("responseData") or {}).get("translatedText", "")
+        if tr and tr.strip():
+            return tr.strip()
+    except Exception as e:
+        print("translate err", e)
+    return None
+
+
 def _norm(t):
     return "".join(ch for ch in t.lower() if ch.isalnum())
 
@@ -145,7 +167,13 @@ def gather(feeds, n=10, domain_label="", only_chinese=False):
                 s = s2.strip()
             t = _clean(t)
             if only_chinese and is_english_title(t):
-                continue
+                # 免费翻译兜底：无 NEWS_API_KEY 也能把英文标题翻成中文推
+                tr = translate_to_zh(t)
+                time.sleep(0.4)  # MyMemory 限速：2 请求/秒
+                if tr:
+                    t = tr
+                else:
+                    continue
             key = _norm(t)
             if not key or key in seen:
                 continue

@@ -1,0 +1,22 @@
+name: 每日要闻速报（云端）
+on:
+  schedule:
+    # UTC 22:30 = 北京时间 06:30（次日）
+    - cron: '30 22 * * *'
+  workflow_dispatch:
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 生成并推送每日要闻
+        run: python digest.py
+        env:
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          NEWS_API_KEY: ${{ secrets.NEWS_API_KEY }}
+          NEWS_BASE_URL: ${{ secrets.NEWS_BASE_URL }}
+          NEWS_MODEL: ${{ secrets.NEWS_MODEL }}

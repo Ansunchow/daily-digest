@@ -115,9 +115,12 @@ def _norm(t):
 
 def _pub(ts):
     try:
-        return parsedate_to_datetime(ts)
+        dt = parsedate_to_datetime(ts)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+        return dt
     except Exception:
-        return datetime.datetime.min
+        return datetime.datetime(2000, 1, 1)
 
 
 def parse_feed(raw, default_source):

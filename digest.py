@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 云端「每日要闻速报」生成器（AI + 智能网络物流 + 每日饮食）。
-- 新闻：RSS 聚合（免费、无需密钥），单源挂掉自动跳过；**已去掉英文源（TechCrunch/ZDNet），全部用中文源，保证「详情」链接打开的原文正文也是中文**；极少量漏网的纯英文标题仍会经 MyMemory 免费接口翻成中文兜底；若另设 NEWS_API_KEY 则升级为「抓正文 + LLM 出中文要点摘要（≤80字）」，内容更扎实。
+- 新闻：RSS 聚合（免费、无需密钥），单源挂掉自动跳过；保留英文独家源（TechCrunch/ZDNet）。若设 NEWS_API_KEY：抓正文 + LLM——**英文媒体条目翻成 180–280 字中文详解内联在推送里**（「详情」链接标注为「英文原文」备查），中文媒体条目给 ≤80 字简洁摘要；极少量漏网纯英文标题经 MyMemory 免费接口兜底翻译。中文源无 Key 时亦给标题级中文。
 - 饮食：按星期几取固定周菜单（确定性，无需联网）。
 - 推送：PushPlus（token 取环境变量 PUSHPLUS_TOKEN，否则取本地 token 文件）。
 设计为可在 GitHub Actions 中运行（cron 触发），与本机 WorkBuddy 无关。
@@ -21,12 +21,16 @@ from email.utils import parsedate_to_datetime
 
 LOCAL_TOKEN = r"D:/workhome/2026-10-03-08-41-34/pushplus_token.txt"
 
-# ---------------- 数据源（RSS，全部为中文源，保证详情页正文也是中文） ----------------
+# ---------------- 数据源（RSS） ----------------
+# 英文源（TechCrunch/ZDNet）保留「英文独家」；其正文由 LLM 抓回后翻译成中文长摘要（180–280字详解）内联在推送里，
+# 「详情」链接标注为「英文原文」备查。中文源条目则只给 ≤80 字简洁摘要。
 AI_FEEDS = [
     ("Google News", "https://news.google.com/rss/search?q=%E4%BA%BA%E5%B7%A5%E6%99%BA%E8%83%BD%20OR%20%E5%A4%A7%E6%A8%A1%E5%9E%8B%20OR%20ChatGPT%20OR%20AI%20Agent%20OR%20AI%E8%8A%AF%E7%89%87&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"),
     ("QbitAI 量子位", "https://www.qbitai.com/feed"),
     ("机器之心", "https://www.jiqizhixin.com/rss"),
     ("36氪", "https://36kr.com/feed"),
+    ("TechCrunch AI", "https://techcrunch.com/category/artificial-intelligence/feed/"),
+    ("ZDNet AI", "https://www.zdnet.com/topic/artificial-intelligence/rss.xml"),
 ]
 LOGI_FEEDS = [
     ("Google News", "https://news.google.com/rss/search?q=%E6%99%BA%E8%83%BD%E7%89%A9%E6%B5%81%20OR%20%E6%99%BA%E6%85%A7%E7%89%A9%E6%B5%81%20OR%20%E7%BD%91%E7%BB%9C%E8%B4%A7%E8%BF%90%20OR%20%E8%87%AA%E5%8A%A8%E9%A9%BE%E9%A9%B6%E5%8D%A1%E8%BD%A6%20OR%20%E6%97%A0%E4%BA%BA%E9%85%8D%E9%80%81%20OR%20%E4%BE%9B%E5%BA%94%E9%93%BE&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"),
@@ -87,6 +91,20 @@ def is_english_title(s):
     has_cjk = any('\u4e00' <= c <= '\u9fff' for c in s)
     has_letter = any(c.isalpha() for c in s)
     return has_letter and not has_cjk
+
+
+ENGLISH_SOURCE_HINTS = ("techcrunch", "zdnet")
+
+
+def is_english_source(c):
+    """判断条目是否来自英文媒体（用于把「详情」链接标注为「英文原文」）。"""
+    s = (c.get("source") or "").lower()
+    l = (c.get("link") or "").lower()
+    if any(h in s for h in ENGLISH_SOURCE_HINTS):
+        return True
+    if any(h in l for h in ENGLISH_SOURCE_HINTS):
+        return True
+    return False
 
 
 def translate_to_zh(text):
@@ -192,11 +210,12 @@ def gather(feeds, n=10, domain_label="", only_chinese=False):
 
     lines = []
     for i, c in enumerate(cands[:n], 1):
-        lines.append(f"{i}. {c['title']}（{c['source']}）<a href='{c['link']}'>详情</a>")
+        label = "英文原文" if is_english_source(c) else "详情"
+        lines.append(f"{i}. {c['title']}（{c['source']}）<a href='{c['link']}'>{label}</a>")
     return "<br>".join(lines)
 
 
-def fetch_article_text(url, timeout=12, max_chars=1500):
+def fetch_article_text(url, timeout=12, max_chars=2200):
     """抓取新闻正文要点（best-effort）：取 <p> 文本并截断，供 LLM 摘要。失败返回空串。"""
     if not url or not url.startswith("http"):
         return ""
@@ -243,8 +262,12 @@ def llm_summarize(domain_label, cands):
     inp = json.dumps(items_in, ensure_ascii=False)
     prompt = (
         f"以下是从 RSS 聚合的「{domain_label}」领域候选新闻（JSON 数组，每条含 title/source/link/content；"
-        f"content 可能为空）。请精选最重要的 10 条，按重要性从高到低排序；"
-        f"对每条用中文写一条摘要（不超过 80 字，概括核心事实、关键数字与影响，不要评论、不要编造 content 之外的信息），并保留 source 与 link。"
+        f"content 可能为空；若 source 为 TechCrunch / ZDNet 等英文媒体，则 content 为英文，需要你翻译成中文）。\n"
+        f"请精选最重要的 10 条，按重要性从高到低排序。对每条用中文输出：\n"
+        f"- 若 source 是英文媒体（TechCrunch/ZDNet）或 content 为英文：写一条「中文详解」（180–280 字），"
+        f"把文章核心事实、关键数字、涉及方、背景与影响讲清楚，相当于把原文翻译并凝练成中文长摘要；\n"
+        f"- 否则（中文媒体）：写一条不超过 80 字的简洁摘要。\n"
+        f"不要评论、不要编造 content 之外的信息；保留 source 与 link。\n"
         f"只返回 JSON，格式：{{\"items\":[{{\"summary\":\"...\",\"source\":\"...\",\"link\":\"...\"}}]}}。"
         f"候选：\n{inp}"
     )
@@ -272,7 +295,8 @@ def format_llm(items, n=10):
     lines = []
     for i, c in enumerate(items[:n], 1):
         link = c.get("link", "")
-        lines.append(f"{i}. {c.get('summary','')}（{c.get('source','')}）<a href='{link}'>详情</a>")
+        label = "英文原文" if is_english_source(c) else "详情"
+        lines.append(f"{i}. {c.get('summary','')}（{c.get('source','')}）<a href='{link}'>{label}</a>")
     return "<br>".join(lines)
 
 

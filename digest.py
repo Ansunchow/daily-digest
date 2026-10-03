@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 云端「每日要闻速报」生成器（AI + 智能网络物流 + 每日饮食）。
-- 新闻：RSS 聚合（免费、无需密钥），单源挂掉自动跳过；纯英文标题自动经 MyMemory 免费接口翻成中文（无需密钥）；若另设 NEWS_API_KEY 则改用 LLM 精编成 ≤40 字摘要。
+- 新闻：RSS 聚合（免费、无需密钥），单源挂掉自动跳过；纯英文标题自动经 MyMemory 免费接口翻成中文（无需密钥）；若另设 NEWS_API_KEY 则升级为「抓正文 + LLM 出中文要点摘要（≤80字）」，内容更扎实。
 - 饮食：按星期几取固定周菜单（确定性，无需联网）。
 - 推送：PushPlus（token 取环境变量 PUSHPLUS_TOKEN，否则取本地 token 文件）。
 设计为可在 GitHub Actions 中运行（cron 触发），与本机 WorkBuddy 无关。
@@ -14,6 +14,7 @@ import time
 import urllib.request
 import urllib.error
 import urllib.parse
+import re
 import datetime
 import html as _html
 from email.utils import parsedate_to_datetime
@@ -166,8 +167,8 @@ def gather(feeds, n=10, domain_label="", only_chinese=False):
                 t, s2 = t.rsplit(" - ", 1)
                 s = s2.strip()
             t = _clean(t)
-            if only_chinese and is_english_title(t):
-                # 免费翻译兜底：无 NEWS_API_KEY 也能把英文标题翻成中文推
+            if only_chinese and is_english_title(t) and not os.environ.get("NEWS_API_KEY"):
+                # 免费翻译兜底：无 NEWS_API_KEY 时把英文标题翻成中文（有 Key 则交给 LLM 翻译+摘要）
                 tr = translate_to_zh(t)
                 time.sleep(0.4)  # MyMemory 限速：2 请求/秒
                 if tr:
@@ -194,17 +195,55 @@ def gather(feeds, n=10, domain_label="", only_chinese=False):
     return "<br>".join(lines)
 
 
+def fetch_article_text(url, timeout=12, max_chars=1500):
+    """抓取新闻正文要点（best-effort）：取 <p> 文本并截断，供 LLM 摘要。失败返回空串。"""
+    if not url or not url.startswith("http"):
+        return ""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read()
+            enc = r.headers.get("Content-Encoding", "")
+            if "gzip" in enc:
+                raw = gzip.decompress(raw)
+            html = None
+            for enc_name in ("utf-8", "gbk", "gb18030", "latin-1"):
+                try:
+                    html = raw.decode(enc_name)
+                    break
+                except Exception:
+                    continue
+            if html is None:
+                html = raw.decode("utf-8", errors="ignore")
+        html = re.sub(r"<script[\s\S]*?</script>", " ", html, flags=re.I)
+        html = re.sub(r"<style[\s\S]*?</style>", " ", html, flags=re.I)
+        paras = re.findall(r"<p[^>]*>([\s\S]*?)</p>", html, flags=re.I)
+        pieces = []
+        for p in paras:
+            txt = _html.unescape(re.sub(r"<[^>]+>", "", p))
+            txt = re.sub(r"\s+", " ", txt).strip()
+            if len(txt) > 20:
+                pieces.append(txt)
+        return " ".join(pieces)[:max_chars]
+    except Exception as e:
+        print("article fetch err", e)
+        return ""
+
+
 def llm_summarize(domain_label, cands):
+    """抓正文 + LLM 出中文要点摘要（≤80字）。需 NEWS_API_KEY。失败返回 None，回退标题版。"""
     key = os.environ.get("NEWS_API_KEY")
     base = os.environ.get("NEWS_BASE_URL", "https://api.openai.com/v1").rstrip("/")
     model = os.environ.get("NEWS_MODEL", "gpt-4o-mini")
-    inp = json.dumps(
-        [{"title": c["title"], "source": c["source"], "link": c["link"]} for c in cands],
-        ensure_ascii=False,
-    )
+    items_in = []
+    for c in cands[:12]:
+        content = fetch_article_text(c["link"])
+        items_in.append({"title": c["title"], "source": c["source"], "link": c["link"], "content": content})
+    inp = json.dumps(items_in, ensure_ascii=False)
     prompt = (
-        f"以下是从 RSS 聚合的「{domain_label}」领域候选新闻（JSON）。请精选最重要的 10 条，"
-        f"按重要性从高到低排序，每条输出：一句话概括（不超过40字）| 来源媒体 | 原文链接。"
+        f"以下是从 RSS 聚合的「{domain_label}」领域候选新闻（JSON 数组，每条含 title/source/link/content；"
+        f"content 可能为空）。请精选最重要的 10 条，按重要性从高到低排序；"
+        f"对每条用中文写一条摘要（不超过 80 字，概括核心事实、关键数字与影响，不要评论、不要编造 content 之外的信息），并保留 source 与 link。"
         f"只返回 JSON，格式：{{\"items\":[{{\"summary\":\"...\",\"source\":\"...\",\"link\":\"...\"}}]}}。"
         f"候选：\n{inp}"
     )
@@ -219,7 +258,7 @@ def llm_summarize(domain_label, cands):
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=60) as r:
+        with urllib.request.urlopen(req, timeout=90) as r:
             j = json.load(r)
         txt = j["choices"][0]["message"]["content"]
         return json.loads(txt).get("items")

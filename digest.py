@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 云端「每日要闻速报」生成器（AI + 智能网络物流 + 每日饮食）。
-- 新闻：RSS 聚合（免费、无需密钥），单源挂掉自动跳过；纯英文标题自动经 MyMemory 免费接口翻成中文（无需密钥）；若另设 NEWS_API_KEY 则升级为「抓正文 + LLM 出中文要点摘要（≤80字）」，内容更扎实。
+- 新闻：RSS 聚合（免费、无需密钥），单源挂掉自动跳过；**已去掉英文源（TechCrunch/ZDNet），全部用中文源，保证「详情」链接打开的原文正文也是中文**；极少量漏网的纯英文标题仍会经 MyMemory 免费接口翻成中文兜底；若另设 NEWS_API_KEY 则升级为「抓正文 + LLM 出中文要点摘要（≤80字）」，内容更扎实。
 - 饮食：按星期几取固定周菜单（确定性，无需联网）。
 - 推送：PushPlus（token 取环境变量 PUSHPLUS_TOKEN，否则取本地 token 文件）。
 设计为可在 GitHub Actions 中运行（cron 触发），与本机 WorkBuddy 无关。
@@ -21,14 +21,12 @@ from email.utils import parsedate_to_datetime
 
 LOCAL_TOKEN = r"D:/workhome/2026-10-03-08-41-34/pushplus_token.txt"
 
-# ---------------- 数据源（RSS） ----------------
+# ---------------- 数据源（RSS，全部为中文源，保证详情页正文也是中文） ----------------
 AI_FEEDS = [
     ("Google News", "https://news.google.com/rss/search?q=%E4%BA%BA%E5%B7%A5%E6%99%BA%E8%83%BD%20OR%20%E5%A4%A7%E6%A8%A1%E5%9E%8B%20OR%20ChatGPT%20OR%20AI%20Agent%20OR%20AI%E8%8A%AF%E7%89%87&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"),
     ("QbitAI 量子位", "https://www.qbitai.com/feed"),
     ("机器之心", "https://www.jiqizhixin.com/rss"),
     ("36氪", "https://36kr.com/feed"),
-    ("TechCrunch AI", "https://techcrunch.com/category/artificial-intelligence/feed/"),
-    ("ZDNet AI", "https://www.zdnet.com/topic/artificial-intelligence/rss.xml"),
 ]
 LOGI_FEEDS = [
     ("Google News", "https://news.google.com/rss/search?q=%E6%99%BA%E8%83%BD%E7%89%A9%E6%B5%81%20OR%20%E6%99%BA%E6%85%A7%E7%89%A9%E6%B5%81%20OR%20%E7%BD%91%E7%BB%9C%E8%B4%A7%E8%BF%90%20OR%20%E8%87%AA%E5%8A%A8%E9%A9%BE%E9%A9%B6%E5%8D%A1%E8%BD%A6%20OR%20%E6%97%A0%E4%BA%BA%E9%85%8D%E9%80%81%20OR%20%E4%BE%9B%E5%BA%94%E9%93%BE&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"),

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 云端「每日要闻速报」生成器（AI + 智能网络物流 + 每日饮食）。
-- 新闻：RSS 聚合（免费、无需密钥），单源挂掉自动跳过；保留英文独家源（TechCrunch/ZDNet）。若设 NEWS_API_KEY：抓正文 + LLM——**英文媒体条目翻成 180–280 字中文详解内联在推送里**（「详情」链接标注为「英文原文」备查），中文媒体条目给 ≤80 字简洁摘要；极少量漏网纯英文标题经 MyMemory 免费接口兜底翻译。中文源无 Key 时亦给标题级中文。
+- 新闻：RSS 聚合（免费、无需密钥），单源挂掉自动跳过；保留英文独家源（TechCrunch/ZDNet）。若设 NEWS_API_KEY：抓正文 + LLM——**英文媒体条目整篇翻译成中文内联在推送里（不用点链接即读全文中文）**（「详情」链接标注为「英文原版」备查），中文媒体条目给 ≤80 字简洁摘要；极少量漏网纯英文标题经 MyMemory 免费接口兜底翻译。中文源无 Key 时亦给标题级中文。
 - 饮食：按星期几取固定周菜单（确定性，无需联网）。
 - 推送：PushPlus（token 取环境变量 PUSHPLUS_TOKEN，否则取本地 token 文件）。
 设计为可在 GitHub Actions 中运行（cron 触发），与本机 WorkBuddy 无关。
@@ -204,13 +204,17 @@ def gather(feeds, n=10, domain_label="", only_chinese=False):
 
     key = os.environ.get("NEWS_API_KEY")
     if key:
-        res = llm_summarize(domain_label, cands)
-        if res:
-            return format_llm(res, n)
+        en = [c for c in cands if is_english_source(c)]
+        zh = [c for c in cands if not is_english_source(c)]
+        zh_res = llm_summarize(domain_label, zh) if zh else None
+        en_res = llm_translate_full(domain_label, en) if en else None
+        if zh_res or en_res:
+            merged = _build_items(cands, (en_res or []) + (zh_res or []))
+            return format_llm(merged, n)
 
     lines = []
     for i, c in enumerate(cands[:n], 1):
-        label = "英文原文" if is_english_source(c) else "详情"
+        label = "英文原版↗" if is_english_source(c) else "详情"
         lines.append(f"{i}. {c['title']}（{c['source']}）<a href='{c['link']}'>{label}</a>")
     return "<br>".join(lines)
 
@@ -264,8 +268,8 @@ def llm_summarize(domain_label, cands):
         f"以下是从 RSS 聚合的「{domain_label}」领域候选新闻（JSON 数组，每条含 title/source/link/content；"
         f"content 可能为空；若 source 为 TechCrunch / ZDNet 等英文媒体，则 content 为英文，需要你翻译成中文）。\n"
         f"请精选最重要的 10 条，按重要性从高到低排序。对每条用中文输出：\n"
-        f"- 若 source 是英文媒体（TechCrunch/ZDNet）或 content 为英文：写一条「中文详解」（180–280 字），"
-        f"把文章核心事实、关键数字、涉及方、背景与影响讲清楚，相当于把原文翻译并凝练成中文长摘要；\n"
+        f"- 若 source 是英文媒体（TechCrunch/ZDNet）或 content 为英文：请**完整翻译成中文**（保留原文主要段落、事实、关键数字、涉及方与结论，翻译全文而非仅摘要；"
+        f"若原文很长，至少翻译最前面约 80% 核心内容，整体不超过 1000 字）；\n"
         f"- 否则（中文媒体）：写一条不超过 80 字的简洁摘要。\n"
         f"不要评论、不要编造 content 之外的信息；保留 source 与 link。\n"
         f"只返回 JSON，格式：{{\"items\":[{{\"summary\":\"...\",\"source\":\"...\",\"link\":\"...\"}}]}}。"
@@ -275,6 +279,7 @@ def llm_summarize(domain_label, cands):
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "response_format": {"type": "json_object"},
+        "max_tokens": 2048,
     }
     req = urllib.request.Request(
         base + "/chat/completions",
@@ -291,11 +296,70 @@ def llm_summarize(domain_label, cands):
         return None
 
 
+def llm_translate_full(domain_label, cands_en):
+    """英文媒体条目：逐条抓正文 + LLM 整篇中文翻译（长，300–800 字）。需 NEWS_API_KEY。失败返回 None。"""
+    key = os.environ.get("NEWS_API_KEY")
+    base = os.environ.get("NEWS_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    model = os.environ.get("NEWS_MODEL", "gpt-4o-mini")
+    out = []
+    for c in cands_en[:8]:  # 英文最多 8 条，逐条调用避免单次负载过大导致超时
+        content = fetch_article_text(c["link"], max_chars=2200)
+        inp = json.dumps(
+            [{"title": c["title"], "source": c["source"], "link": c["link"], "content": content}],
+            ensure_ascii=False,
+        )
+        prompt = (
+            f"以下是一则「{domain_label}」领域英文媒体新闻（JSON，含 title/source/link/content；content 为英文正文）。\n"
+            f"请做**完整中文翻译**：保留原文主要段落、事实、关键数字、涉及方、背景与结论，翻译全文而非仅摘要；"
+            f"重要：必须输出至少 300 字的中文翻译，覆盖原文全部主要段落，绝不能只翻译标题；"
+            f"若原文很长，至少翻译最前面约 80% 核心内容，长度控制在 300–800 字。\n"
+            f"不要评论、不要编造 content 之外的信息；保留 source 与 link。\n"
+            f"只返回 JSON，格式：{{\"items\":[{{\"summary\":\"...\",\"source\":\"...\",\"link\":\"...\"}}]}}。候选：\n{inp}"
+        )
+        data = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "response_format": {"type": "json_object"},
+            "max_tokens": 1500,
+        }
+        req = urllib.request.Request(
+            base + "/chat/completions",
+            data=json.dumps(data).encode("utf-8"),
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=90) as r:
+                j = json.load(r)
+            txt = j["choices"][0]["message"]["content"]
+            items = json.loads(txt).get("items") or []
+            if items and items[0].get("summary"):
+                out.append(items[0])
+        except Exception as e:
+            print("llm translate err", e)
+    return out if out else None
+
+
+def _build_items(cands, llm_items):
+    """按 cands 原始顺序合并 LLM 结果；LLM 漏掉/失败的条目回退为标题版。"""
+    by_link = {}
+    for it in (llm_items or []):
+        if it.get("link"):
+            by_link[it["link"]] = it
+    out = []
+    for c in cands:
+        it = by_link.get(c["link"])
+        if it and it.get("summary"):
+            out.append(it)
+        else:
+            out.append({"summary": c["title"], "source": c["source"], "link": c["link"]})
+    return out
+
+
 def format_llm(items, n=10):
     lines = []
     for i, c in enumerate(items[:n], 1):
         link = c.get("link", "")
-        label = "英文原文" if is_english_source(c) else "详情"
+        label = "英文原版↗" if is_english_source(c) else "详情"
         lines.append(f"{i}. {c.get('summary','')}（{c.get('source','')}）<a href='{link}'>{label}</a>")
     return "<br>".join(lines)
 
